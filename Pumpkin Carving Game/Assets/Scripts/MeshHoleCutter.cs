@@ -44,6 +44,8 @@ using UnityEngine.InputSystem;
 [DisallowMultipleComponent]
 public class MeshHoleCutter : MonoBehaviour
 {
+    const float ReferenceResolutionHeight = 768f;
+
     public enum Mode { Rotate = 0, Cut = 1, Scrape = 2 }
 
     // ------------------------------------------------------------------ Inspector
@@ -222,6 +224,18 @@ public class MeshHoleCutter : MonoBehaviour
     Rect uiRect = new Rect(10, 10, 300, 140);
     static readonly string[] ModeLabels = { "Rotate [1]", "Cut [2]", "Scrape [3]" };
 
+    public float UiScale => Mathf.Max(Screen.height, 1) / ReferenceResolutionHeight;
+
+    float InputScale
+    {
+        get
+        {
+            float height = cam ? cam.pixelRect.height : Screen.height;
+            if (height <= 0f) height = Screen.height;
+            return Mathf.Max(height, 1f) / ReferenceResolutionHeight;
+        }
+    }
+
     // edit history
     List<MeshEdit> history = new List<MeshEdit>();
     int cursor;                          // number of edits currently applied (undo / redo position)
@@ -296,7 +310,8 @@ public class MeshHoleCutter : MonoBehaviour
         bool hasCuttableMesh = targetPumpkin && rotationRoot && HasCuttableMesh();
 
         Vector2 mp = CutInput.MousePosition;
-        Vector2 guiMouse = new Vector2(mp.x, Screen.height - mp.y);
+        float uiScale = UiScale;
+        Vector2 guiMouse = new Vector2(mp.x, Screen.height - mp.y) / uiScale;
         bool overUI = (showUI && uiRect.Contains(guiMouse)) || extraBlockedRect.Contains(guiMouse);
 
         if (CutInput.Key1) SetMode(Mode.Rotate);
@@ -325,6 +340,8 @@ public class MeshHoleCutter : MonoBehaviour
     void OnGUI()
     {
         if (!showUI) return;
+        Matrix4x4 originalMatrix = GUI.matrix;
+        GUI.matrix = Matrix4x4.Scale(new Vector3(UiScale, UiScale, 1f)) * originalMatrix;
         GUILayout.BeginArea(uiRect, GUI.skin.box);
         int sel = GUILayout.Toolbar((int)mode, ModeLabels);
         if (sel != (int)mode) SetMode((Mode)sel);
@@ -346,6 +363,7 @@ public class MeshHoleCutter : MonoBehaviour
         GUILayout.EndHorizontal();
         GUILayout.Label("Triangles: " + (T.Count / 3) + "   Edits: " + cursor + "/" + history.Count);
         GUILayout.EndArea();
+        GUI.matrix = originalMatrix;
     }
 
     // ------------------------------------------------------------------ Public API
@@ -407,13 +425,13 @@ public class MeshHoleCutter : MonoBehaviour
             sourceTriangleCount = sourceTriCount,
             edits = history.GetRange(0, cursor)
         };
-        return JsonUtility.ToJson(log, prettyPrint);
+        return MeshEditLog.ToJson(log, prettyPrint);
     }
 
     /// <summary>Loads a log and rebuilds the mesh from it.</summary>
     public bool ImportLog(string json)
     {
-        MeshEditLog log = JsonUtility.FromJson<MeshEditLog>(json);
+        MeshEditLog log = MeshEditLog.FromJson(json);
         if (log == null || log.edits == null) return false;
         if (log.sourceVertexCount != sourceMesh.vertexCount || log.sourceTriangleCount != sourceTriCount)
         {
@@ -608,6 +626,7 @@ public class MeshHoleCutter : MonoBehaviour
                 Vector2 d = mp - lastMouse;
                 if (draggingPumpkin)
                 {
+                    d /= InputScale;
                     totalYaw -= d.x * rotateSpeed;
                     totalPitch = Mathf.Clamp(totalPitch + d.y * rotateSpeed, minRotationX, maxRotationX);
 
@@ -667,7 +686,7 @@ public class MeshHoleCutter : MonoBehaviour
         }
         else if (dragging && CutInput.IsHeld)
         {
-            if (Vector2.Distance(mp, lasso[lasso.Count - 1]) >= lassoPointSpacing)
+            if (Vector2.Distance(mp, lasso[lasso.Count - 1]) >= lassoPointSpacing * InputScale)
             {
                 lasso.Add(mp);
                 AddLinePoint(mp);
@@ -697,7 +716,8 @@ public class MeshHoleCutter : MonoBehaviour
         // input filter: ignore tiny shapes
         List<Vector2> preview = new List<Vector2>(lasso);
         for (int i = 0; i < lassoSmoothing; i++) preview = Chaikin(preview);
-        if (Mathf.Abs(SignedArea(preview)) < minLassoArea) { lasso.Clear(); return; }
+        float areaScale = InputScale;
+        if (Mathf.Abs(SignedArea(preview)) < minLassoArea * areaScale * areaScale) { lasso.Clear(); return; }
 
         // record what the player did; Commit applies it and stores it in the history
         var e = new MeshEdit
@@ -710,7 +730,7 @@ public class MeshHoleCutter : MonoBehaviour
         e.values[LassoValues.Smoothing] = lassoSmoothing;
         e.values[LassoValues.FrontOnly] = frontFacesOnly ? 1f : 0f;
         e.values[LassoValues.Depth] = cutDepth;
-        e.values[LassoValues.EdgePx] = edgePixels;
+        e.values[LassoValues.EdgePx] = edgePixels * InputScale;
         e.values[LassoValues.Curvature] = curvatureSmoothing;
         e.values[LassoValues.RemoveLoose] = removeLooseParts ? 1f : 0f;
         e.values[LassoValues.MaxPasses] = maxRefinePasses;
@@ -736,7 +756,8 @@ public class MeshHoleCutter : MonoBehaviour
         }
 
         // small shapes get finer triangles so their outline never looks coarse
-        float targetPx = Mathf.Clamp(perimeter / 64f, 1.5f, Mathf.Max(1.5f, edgePixels));
+        float minimumEdgePx = 1.5f * Mathf.Max(activeCam.pixelRect.height, 1f) / ReferenceResolutionHeight;
+        float targetPx = Mathf.Clamp(perimeter / 64f, minimumEdgePx, Mathf.Max(minimumEdgePx, edgePixels));
         PerformCut(targetPx);
     }
 
@@ -1932,7 +1953,7 @@ public class MeshHoleCutter : MonoBehaviour
         float pxWorld = cam.orthographic
             ? 2f * cam.orthographicSize / cam.pixelHeight
             : 2f * d * Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad) / cam.pixelHeight;
-        lassoLine.widthMultiplier = lassoWidthPixels * pxWorld;
+        lassoLine.widthMultiplier = lassoWidthPixels * InputScale * pxWorld;
     }
 
     void HideLine()

@@ -286,13 +286,13 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::CarveScorer
   cutter: {fileID: 7241303645776989198}
-  devMode: 0
+  devMode: 1
   templates:
   - {fileID: 4900000, guid: aa85da17146d83b47af3d2524e321bc3, type: 3}
   templateIndex: 0
   newReferenceName: 1
   sampleCount: 40000
-  showGuide: 0
+  showGuide: 1
   guideColor: {r: 0.2, g: 1, b: 1, a: 0.9}
   guideWidth: 0.012
   guideOffset: 0.01
@@ -349,7 +349,7 @@ Light:
   m_InnerSpotAngle: 21.80208
   m_CookieSize: 10
   m_Shadows:
-    m_Type: 1
+    m_Type: 0
     m_Resolution: -1
     m_CustomResolution: -1
     m_Strength: 1
@@ -570,7 +570,7 @@ MonoBehaviour:
   minCameraX: -4
   maxCameraX: 4
   lassoPointSpacing: 8
-  lassoSmoothing: 3
+  lassoSmoothing: 2
   minLassoArea: 150
   frontFacesOnly: 1
   cutDepth: 0.1
@@ -589,7 +589,7 @@ MonoBehaviour:
   solidShell: 1
   innerMaterial: {fileID: 2100000, guid: bf4f06e9f0547544a9af95d274f48c15, type: 2}
   wallsUseInnerMaterial: 1
-  edgePixels: 0.05
+  edgePixels: 0.01
   curvatureSmoothing: 1
   maxRefinePasses: 1
   maxTriangles: 25000

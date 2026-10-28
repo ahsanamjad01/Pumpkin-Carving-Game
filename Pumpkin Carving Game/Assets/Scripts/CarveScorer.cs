@@ -257,8 +257,11 @@ public class CarveScorer : MonoBehaviour
     {
         if (!showScoreUI || !cutter) return;
 
-        var r = new Rect(10, Screen.height - 150, 340, 140);
+        float uiScale = cutter.UiScale;
+        var r = new Rect(10, Screen.height / uiScale - 150, 340, 140);
         cutter.extraBlockedRect = r;
+        Matrix4x4 originalMatrix = GUI.matrix;
+        GUI.matrix = Matrix4x4.Scale(new Vector3(uiScale, uiScale, 1f)) * originalMatrix;
         GUILayout.BeginArea(r, GUI.skin.box);
 
         if (devMode)
@@ -280,6 +283,7 @@ public class CarveScorer : MonoBehaviour
         else GUILayout.Label("No target shape assigned (see Templates)");
 
         GUILayout.EndArea();
+        GUI.matrix = originalMatrix;
     }
 
     // ------------------------------------------------------------------ Public API
@@ -295,7 +299,7 @@ public class CarveScorer : MonoBehaviour
     {
         if (!cutter || samples == null || !asset) return false;
 
-        MeshEditLog log = JsonUtility.FromJson<MeshEditLog>(asset.text);
+        MeshEditLog log = MeshEditLog.FromJson(asset.text);
         if (log == null || log.edits == null || log.edits.Count == 0)
         {
             Debug.LogWarning("CarveScorer: " + asset.name + " has no edits.");

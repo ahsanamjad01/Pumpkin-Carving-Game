@@ -1,5 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Text;
 using UnityEngine;
 
 /// <summary>Tool ids stored in MeshEdit.tool. Add new tools here.</summary>
@@ -65,6 +68,372 @@ public class MeshEditLog
     public int sourceVertexCount;      // sanity check: the log only makes sense for the mesh it was recorded on
     public int sourceTriangleCount;
     public List<MeshEdit> edits = new List<MeshEdit>();
+
+    const int PackedMagic = 0x314C454D; // MEL1
+    const string PackedFormat = "MEL1";
+    const float ScreenPointPrecision = 256f;
+    const int MaxCollectionLength = 1000000;
+
+    [Serializable]
+    sealed class PackedEnvelope
+    {
+        public string format;
+        public string data;
+    }
+
+    /// <summary>Writes compressed JSON with subpixel point precision. Legacy expanded JSON remains readable.</summary>
+    public static string ToJson(MeshEditLog log, bool prettyPrint = false)
+    {
+        if (log == null) throw new ArgumentNullException(nameof(log));
+        if (log.edits == null) throw new InvalidDataException("An edit log must contain an edit list.");
+
+        byte[] payload;
+        using (var raw = new MemoryStream())
+        {
+            using (var writer = new BinaryWriter(raw, Encoding.UTF8, true))
+                WritePackedLog(writer, log);
+
+            raw.Position = 0;
+            using (var compressed = new MemoryStream())
+            {
+                using (var gzip = new GZipStream(compressed, System.IO.Compression.CompressionLevel.Optimal, true))
+                    raw.CopyTo(gzip);
+                payload = compressed.ToArray();
+            }
+        }
+
+        return JsonUtility.ToJson(new PackedEnvelope
+        {
+            format = PackedFormat,
+            data = Convert.ToBase64String(payload)
+        }, prettyPrint);
+    }
+
+    /// <summary>Reads both compact logs and the original JsonUtility format.</summary>
+    public static MeshEditLog FromJson(string json)
+    {
+        if (string.IsNullOrEmpty(json)) return null;
+
+        if (json.IndexOf("\"format\"", StringComparison.Ordinal) >= 0)
+        {
+            PackedEnvelope envelope = JsonUtility.FromJson<PackedEnvelope>(json);
+            if (envelope != null && envelope.format == PackedFormat)
+                return FromPackedBytes(Convert.FromBase64String(envelope.data));
+        }
+
+        return JsonUtility.FromJson<MeshEditLog>(json);
+    }
+
+    static void WritePackedLog(BinaryWriter writer, MeshEditLog log)
+    {
+        writer.Write(PackedMagic);
+        writer.Write(log.version);
+        writer.Write(log.meshName ?? string.Empty);
+        writer.Write(log.sourceVertexCount);
+        writer.Write(log.sourceTriangleCount);
+
+        var cameras = new List<CameraSnapshot>();
+        var cameraIndices = new int[log.edits.Count];
+        for (int i = 0; i < log.edits.Count; i++)
+        {
+            MeshEdit edit = log.edits[i];
+            if (edit == null) throw new InvalidDataException("An edit log cannot contain a null edit.");
+
+            int cameraIndex = FindCamera(cameras, edit.camera);
+            if (cameraIndex < 0)
+            {
+                cameraIndex = cameras.Count;
+                cameras.Add(edit.camera);
+            }
+            cameraIndices[i] = cameraIndex;
+        }
+
+        writer.Write(cameras.Count);
+        for (int i = 0; i < cameras.Count; i++)
+            WriteCamera(writer, cameras[i]);
+
+        writer.Write(log.edits.Count);
+        for (int i = 0; i < log.edits.Count; i++)
+            WriteEdit(writer, log.edits[i], cameraIndices[i]);
+    }
+
+    static MeshEditLog FromPackedBytes(byte[] payload)
+    {
+        using (var compressed = new MemoryStream(payload, false))
+        using (var gzip = new GZipStream(compressed, CompressionMode.Decompress))
+        using (var reader = new BinaryReader(gzip, Encoding.UTF8))
+        {
+            if (reader.ReadInt32() != PackedMagic)
+                throw new InvalidDataException("The edit log has an invalid packed-data header.");
+
+            var log = new MeshEditLog
+            {
+                version = reader.ReadInt32(),
+                meshName = reader.ReadString(),
+                sourceVertexCount = reader.ReadInt32(),
+                sourceTriangleCount = reader.ReadInt32()
+            };
+
+            int cameraCount = ReadCount(reader, "camera");
+            var cameras = new CameraSnapshot[cameraCount];
+            for (int i = 0; i < cameraCount; i++)
+                cameras[i] = ReadCamera(reader);
+
+            int editCount = ReadCount(reader, "edit");
+            log.edits = new List<MeshEdit>(editCount);
+            for (int i = 0; i < editCount; i++)
+                log.edits.Add(ReadEdit(reader, cameras));
+
+            return log;
+        }
+    }
+
+    static void WriteEdit(BinaryWriter writer, MeshEdit edit, int cameraIndex)
+    {
+        writer.Write(edit.tool);
+
+        Vector2[] points2D = edit.points2D ?? new Vector2[0];
+        writer.Write(points2D.Length);
+        int lastX = 0, lastY = 0;
+        for (int i = 0; i < points2D.Length; i++)
+        {
+            int x = QuantizeScreenPoint(points2D[i].x);
+            int y = QuantizeScreenPoint(points2D[i].y);
+            WriteSignedVarInt(writer, unchecked(x - lastX));
+            WriteSignedVarInt(writer, unchecked(y - lastY));
+            lastX = x;
+            lastY = y;
+        }
+
+        float[] values = edit.values ?? new float[0];
+        writer.Write(values.Length);
+        for (int i = 0; i < values.Length; i++)
+            writer.Write(values[i]);
+
+        writer.Write(cameraIndex);
+        WritePoints3D(writer, edit.points3D);
+        writer.Write(edit.areaRemoved);
+        writer.Write(edit.trianglesBefore);
+        writer.Write(edit.trianglesAfter);
+        writer.Write(edit.time);
+    }
+
+    static MeshEdit ReadEdit(BinaryReader reader, CameraSnapshot[] cameras)
+    {
+        int tool = reader.ReadInt32();
+        int pointCount = ReadCount(reader, "2D point");
+        var points2D = new Vector2[pointCount];
+        int x = 0, y = 0;
+        for (int i = 0; i < pointCount; i++)
+        {
+            x = unchecked(x + ReadVarInt(reader));
+            y = unchecked(y + ReadVarInt(reader));
+            points2D[i] = new Vector2(x / ScreenPointPrecision, y / ScreenPointPrecision);
+        }
+
+        int valueCount = ReadCount(reader, "value");
+        var values = new float[valueCount];
+        for (int i = 0; i < valueCount; i++)
+            values[i] = reader.ReadSingle();
+
+        int cameraIndex = reader.ReadInt32();
+        if (cameraIndex < 0 || cameraIndex >= cameras.Length)
+            throw new InvalidDataException("The edit log contains an invalid camera reference.");
+
+        return new MeshEdit
+        {
+            tool = tool,
+            points2D = points2D,
+            values = values,
+            camera = cameras[cameraIndex],
+            points3D = ReadPoints3D(reader),
+            areaRemoved = reader.ReadSingle(),
+            trianglesBefore = reader.ReadInt32(),
+            trianglesAfter = reader.ReadInt32(),
+            time = reader.ReadSingle()
+        };
+    }
+
+    static void WritePoints3D(BinaryWriter writer, Vector3[] points)
+    {
+        int count = points == null ? 0 : points.Length;
+        writer.Write(count);
+        if (count == 0) return;
+
+        Vector3 min = points[0], max = points[0];
+        for (int i = 0; i < count; i++)
+        {
+            EnsureFinite(points[i].x);
+            EnsureFinite(points[i].y);
+            EnsureFinite(points[i].z);
+            min = Vector3.Min(min, points[i]);
+            max = Vector3.Max(max, points[i]);
+        }
+
+        WriteVector3(writer, min);
+        WriteVector3(writer, max);
+        for (int i = 0; i < count; i++)
+        {
+            writer.Write(QuantizeCoordinate(points[i].x, min.x, max.x));
+            writer.Write(QuantizeCoordinate(points[i].y, min.y, max.y));
+            writer.Write(QuantizeCoordinate(points[i].z, min.z, max.z));
+        }
+    }
+
+    static Vector3[] ReadPoints3D(BinaryReader reader)
+    {
+        int count = ReadCount(reader, "3D point");
+        if (count == 0) return new Vector3[0];
+
+        Vector3 min = ReadVector3(reader);
+        Vector3 max = ReadVector3(reader);
+        var points = new Vector3[count];
+        for (int i = 0; i < count; i++)
+        {
+            points[i] = new Vector3(
+                DequantizeCoordinate(reader.ReadUInt16(), min.x, max.x),
+                DequantizeCoordinate(reader.ReadUInt16(), min.y, max.y),
+                DequantizeCoordinate(reader.ReadUInt16(), min.z, max.z));
+        }
+        return points;
+    }
+
+    static ushort QuantizeCoordinate(float value, float min, float max)
+    {
+        float range = max - min;
+        if (range <= 0f) return 0;
+        return (ushort)Mathf.Clamp(Mathf.RoundToInt((value - min) / range * ushort.MaxValue), 0, ushort.MaxValue);
+    }
+
+    static float DequantizeCoordinate(ushort value, float min, float max)
+    {
+        return Mathf.Lerp(min, max, value / (float)ushort.MaxValue);
+    }
+
+    static int QuantizeScreenPoint(float value)
+    {
+        EnsureFinite(value);
+        double quantized = Math.Round(value * ScreenPointPrecision);
+        if (quantized < int.MinValue || quantized > int.MaxValue)
+            throw new InvalidDataException("A screen point is outside the compact edit-log range.");
+        return (int)quantized;
+    }
+
+    static void EnsureFinite(float value)
+    {
+        if (float.IsNaN(value) || float.IsInfinity(value))
+            throw new InvalidDataException("Edit logs cannot store non-finite point coordinates.");
+    }
+
+    static void WriteVarInt(BinaryWriter writer, uint value)
+    {
+        while (value >= 0x80)
+        {
+            writer.Write((byte)(value | 0x80));
+            value >>= 7;
+        }
+        writer.Write((byte)value);
+    }
+
+    static void WriteSignedVarInt(BinaryWriter writer, int value)
+    {
+        WriteVarInt(writer, unchecked((uint)((value << 1) ^ (value >> 31))));
+    }
+
+    static int ReadVarInt(BinaryReader reader)
+    {
+        uint value = 0;
+        for (int shift = 0; shift < 35; shift += 7)
+        {
+            byte next = reader.ReadByte();
+            value |= (uint)(next & 0x7F) << shift;
+            if ((next & 0x80) == 0)
+                return unchecked((int)((value >> 1) ^ (uint)-(int)(value & 1)));
+        }
+        throw new InvalidDataException("The edit log contains an invalid point delta.");
+    }
+
+    static int ReadCount(BinaryReader reader, string description)
+    {
+        int count = reader.ReadInt32();
+        if (count < 0 || count > MaxCollectionLength)
+            throw new InvalidDataException("The edit log contains an invalid " + description + " count.");
+        return count;
+    }
+
+    static int FindCamera(List<CameraSnapshot> cameras, CameraSnapshot camera)
+    {
+        for (int i = 0; i < cameras.Count; i++)
+        {
+            CameraSnapshot candidate = cameras[i];
+            if (SameMatrix(candidate.viewFromLocal, camera.viewFromLocal) &&
+                SameMatrix(candidate.projection, camera.projection) &&
+                candidate.pixelRect.x == camera.pixelRect.x &&
+                candidate.pixelRect.y == camera.pixelRect.y &&
+                candidate.pixelRect.width == camera.pixelRect.width &&
+                candidate.pixelRect.height == camera.pixelRect.height &&
+                candidate.orthographic == camera.orthographic)
+                return i;
+        }
+        return -1;
+    }
+
+    static bool SameMatrix(Matrix4x4 a, Matrix4x4 b)
+    {
+        for (int i = 0; i < 16; i++)
+            if (a[i] != b[i]) return false;
+        return true;
+    }
+
+    static void WriteCamera(BinaryWriter writer, CameraSnapshot camera)
+    {
+        WriteMatrix(writer, camera.viewFromLocal);
+        WriteMatrix(writer, camera.projection);
+        writer.Write(camera.pixelRect.x);
+        writer.Write(camera.pixelRect.y);
+        writer.Write(camera.pixelRect.width);
+        writer.Write(camera.pixelRect.height);
+        writer.Write(camera.orthographic);
+    }
+
+    static CameraSnapshot ReadCamera(BinaryReader reader)
+    {
+        return new CameraSnapshot
+        {
+            viewFromLocal = ReadMatrix(reader),
+            projection = ReadMatrix(reader),
+            pixelRect = new Rect(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle()),
+            orthographic = reader.ReadBoolean()
+        };
+    }
+
+    static void WriteMatrix(BinaryWriter writer, Matrix4x4 matrix)
+    {
+        for (int row = 0; row < 4; row++)
+            for (int column = 0; column < 4; column++)
+                writer.Write(matrix[row, column]);
+    }
+
+    static Matrix4x4 ReadMatrix(BinaryReader reader)
+    {
+        var matrix = new Matrix4x4();
+        for (int row = 0; row < 4; row++)
+            for (int column = 0; column < 4; column++)
+                matrix[row, column] = reader.ReadSingle();
+        return matrix;
+    }
+
+    static void WriteVector3(BinaryWriter writer, Vector3 value)
+    {
+        writer.Write(value.x);
+        writer.Write(value.y);
+        writer.Write(value.z);
+    }
+
+    static Vector3 ReadVector3(BinaryReader reader)
+    {
+        return new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+    }
 }
 
 // ====================================================================== comparison
