@@ -10,8 +10,21 @@ public static class EditTool
 {
     public const int LassoCut = 0;
     public const int Scrape = 1;
+    public const int Paint = 2;
     // public const int Extrude = 1;
     // public const int Smooth  = 2;
+}
+
+/// <summary>Layout of MeshEdit.values for EditTool.Paint.</summary>
+public static class PaintValues
+{
+    public const int Hardness = 0;
+    public const int Opacity = 1;
+    public const int Red = 2;
+    public const int Green = 3;
+    public const int Blue = 4;
+    public const int Alpha = 5;
+    public const int Header = 6;
 }
 
 /// <summary>Layout of MeshEdit.values for EditTool.LassoCut (the settings that were active for that cut).</summary>

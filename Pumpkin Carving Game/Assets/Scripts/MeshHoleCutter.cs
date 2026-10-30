@@ -11,6 +11,7 @@ using UnityEngine.InputSystem;
 ///   [1] Rotate : left-mouse drag rotates the object.
 ///   [2] Cut    : left-mouse drag draws a shape; on release the area inside the shape is cut out.
 ///   [3] Scrape : left-mouse drag scrapes the skin: paints the light inner color and a generated normal map so it looks indented.
+///   [4] Paint  : left-mouse drag paints a color over the base texture.
 ///   [Tab]      : cycles through the modes.
 ///
 /// HOW CUTTING WORKS
@@ -38,15 +39,16 @@ using UnityEngine.InputSystem;
 ///   - The mesh must have Read/Write enabled (Unity primitives already do).
 ///   - Use a uniform scale on the object.
 ///   - Scrape needs a UV unwrap WITHOUT overlapping islands (mirrored / overlapping UVs paint in several places at once).
-///   - Scrape supports the Standard shader and URP Lit (_MainTex/_BaseMap + _BumpMap).
-///   - Add "Scrape" to your EditTool enum.
+///   - Scrape supports Standard / URP Lit and toon-style materials that expose a base texture plus a normal-map
+///     on names like _MainTex/_BaseMap/_BaseColorMap and _BumpMap/_NormalMap/NormalMap.
+///   - Paint and scrape strokes share the edit history.
 /// </summary>
 [DisallowMultipleComponent]
 public class MeshHoleCutter : MonoBehaviour
 {
     const float ReferenceResolutionHeight = 768f;
 
-    public enum Mode { Rotate = 0, Cut = 1, Scrape = 2 }
+    public enum Mode { Rotate = 0, Cut = 1, Scrape = 2, Paint = 3 }
 
     // ------------------------------------------------------------------ Inspector
     [Header("General")]
@@ -104,6 +106,15 @@ public class MeshHoleCutter : MonoBehaviour
     [Range(0f, 1f)] public float scrapeRimDarken = 0.35f;
     [Tooltip("Resolution of the generated paint textures. 1024 is good for desktop, 512 for mobile.")]
     public int paintTextureSize = 1024;
+    [Header("Paint Mode")]
+    [Tooltip("Color applied by the paint brush.")]
+    public Color paintColor = Color.red;
+    [Tooltip("Paint brush radius in world units.")]
+    public float paintRadius = 0.08f;
+    [Tooltip("0 = soft brush, 1 = hard edged brush.")]
+    [Range(0f, 0.95f)] public float paintHardness = 0.5f;
+    [Tooltip("Opacity of each paint brush dab.")]
+    [Range(0f, 1f)] public float paintOpacity = 1f;
 
     [Header("Hole Edge (solid look)")]
     [Tooltip("How far the hole rim is intruded / the shell thickness, in world units")]
@@ -207,11 +218,15 @@ public class MeshHoleCutter : MonoBehaviour
     Color32[] baseCol;                                       // original albedo (tint baked in)
     float[] heightMap;                                       // 0 = surface, -1 = deepest scrape
     float[] maskMap;                                         // 0..1 how much the inner color shows
+    Color32[] paintColorMap;
+    float[] paintAlphaMap;
     int pw, ph;
     bool paintReady, paintDirty, anyPaint;
     int dirtyMinX, dirtyMinY, dirtyMaxX, dirtyMaxY;
     float sHard, sGrain, sDepth;                             // stamp parameters of the stroke being executed
-    bool scraping;
+    float pHard, pOpacity;
+    Color32 pColor;
+    bool scraping, painting;
     Vector2 scrapeLastScreen;
     float lastRadiusUV = 0.03f;
     List<Vector2> strokeUV = new List<Vector2>();
@@ -222,7 +237,7 @@ public class MeshHoleCutter : MonoBehaviour
     bool dirty, colliderDirty, dragging, justPressed;
     Vector2 lastMouse;
     Rect uiRect = new Rect(10, 10, 300, 140);
-    static readonly string[] ModeLabels = { "Rotate [1]", "Cut [2]", "Scrape [3]" };
+    static readonly string[] ModeLabels = { "Rotate [1]", "Cut [2]", "Scrape [3]", "Paint [4]" };
 
     public float UiScale => Mathf.Max(Screen.height, 1) / ReferenceResolutionHeight;
 
@@ -317,7 +332,8 @@ public class MeshHoleCutter : MonoBehaviour
         if (CutInput.Key1) SetMode(Mode.Rotate);
         if (CutInput.Key2) SetMode(Mode.Cut);
         if (CutInput.Key3) SetMode(Mode.Scrape);
-        if (CutInput.Tab) SetMode((Mode)(((int)mode + 1) % 3));
+        if (CutInput.Key4) SetMode(Mode.Paint);
+        if (CutInput.Tab) SetMode((Mode)(((int)mode + 1) % ModeLabels.Length));
         if (!dragging)
         {
             if (CutInput.UndoPressed) Undo();
@@ -326,7 +342,8 @@ public class MeshHoleCutter : MonoBehaviour
 
         if (mode == Mode.Rotate || !hasCuttableMesh) UpdateRotate(mp, overUI, hasCuttableMesh);
         else if (mode == Mode.Cut) UpdateCut(mp, overUI);
-        else UpdateScrape(mp, overUI);
+        else if (mode == Mode.Scrape) UpdateScrape(mp, overUI);
+        else UpdatePaint(mp, overUI);
 
         if (hasCuttableMesh && dirty) { RebuildMesh(); dirty = false; }
         if (hasCuttableMesh && colliderDirty && !dragging)
@@ -350,6 +367,7 @@ public class MeshHoleCutter : MonoBehaviour
         if (!HasCuttableMesh()) hint = "No cuttable mesh; hold left mouse + drag to pan";
         else if (mode == Mode.Cut) hint = "Hold left mouse and draw a shape to cut it out";
         else if (mode == Mode.Scrape) hint = "Hold left mouse and drag to scrape the skin";
+        else if (mode == Mode.Paint) hint = "Hold left mouse and drag to paint the skin";
         else hint = "Hold left mouse + drag to rotate";
         GUILayout.Label(hint);
 
@@ -370,6 +388,7 @@ public class MeshHoleCutter : MonoBehaviour
     public void SetMode(Mode m)
     {
         if (scraping) { scraping = false; FinishScrape(); }
+        if (painting) { painting = false; FinishPaint(); }
         mode = m;
         dragging = false;
         lasso.Clear();
@@ -490,6 +509,7 @@ public class MeshHoleCutter : MonoBehaviour
         {
             case EditTool.LassoCut: return ExecuteLasso(e);
             case EditTool.Scrape: return ExecuteScrape(e);
+            case EditTool.Paint: return ExecutePaint(e);
             // case EditTool.YourNewTool: return ExecuteYourNewTool(e);
             default:
                 Debug.LogWarning("MeshHoleCutter: unknown edit tool " + e.tool);
@@ -828,6 +848,104 @@ public class MeshHoleCutter : MonoBehaviour
         }
     }
 
+    void UpdatePaint(Vector2 mp, bool overUI)
+    {
+        if (CutInput.PressedThisFrame && !overUI && EnsurePaintLayer(false))
+        {
+            painting = true;
+            dragging = true;
+            strokeUV.Clear(); strokeR.Clear(); strokeP3.Clear();
+            pHard = paintHardness;
+            pOpacity = paintOpacity;
+            pColor = paintColor;
+            AddPaintPoint(mp);
+            scrapeLastScreen = mp;
+        }
+        else if (painting && CutInput.IsHeld)
+        {
+            float dist = Vector2.Distance(mp, scrapeLastScreen);
+            if (dist >= 1.5f)
+            {
+                int steps = Mathf.Clamp(Mathf.CeilToInt(dist / 4f), 1, 12);
+                for (int i = 1; i <= steps; i++)
+                    AddPaintPoint(Vector2.Lerp(scrapeLastScreen, mp, i / (float)steps));
+                scrapeLastScreen = mp;
+            }
+        }
+
+        if (painting && !CutInput.IsHeld)
+        {
+            painting = false;
+            dragging = false;
+            FinishPaint();
+        }
+    }
+
+    void AddPaintPoint(Vector2 screen)
+    {
+        if (!RaycastSurface(screen, out Vector2 uv, out Vector3 localHit, out float uvPerLocal)) return;
+
+        float r = uvPerLocal > 0f ? paintRadius / UniformScale() * uvPerLocal : lastRadiusUV;
+        if (strokeUV.Count > 0) r = Mathf.Lerp(lastRadiusUV, r, 0.5f);
+        lastRadiusUV = r;
+
+        strokeUV.Add(uv);
+        strokeR.Add(r);
+        strokeP3.Add(localHit);
+
+        int n = strokeUV.Count;
+        if (n == 1) StampPaintSegment(uv, r, uv, r);
+        else StampPaintSegment(strokeUV[n - 2], strokeR[n - 2], uv, r);
+    }
+
+    void FinishPaint()
+    {
+        if (strokeUV.Count == 0) return;
+
+        var e = new MeshEdit
+        {
+            tool = EditTool.Paint,
+            points2D = strokeUV.ToArray(),
+            values = new float[PaintValues.Header + strokeUV.Count],
+            camera = CaptureCamera()
+        };
+        e.values[PaintValues.Hardness] = pHard;
+        e.values[PaintValues.Opacity] = pOpacity;
+        e.values[PaintValues.Red] = pColor.r / 255f;
+        e.values[PaintValues.Green] = pColor.g / 255f;
+        e.values[PaintValues.Blue] = pColor.b / 255f;
+        e.values[PaintValues.Alpha] = pColor.a / 255f;
+        for (int i = 0; i < strokeR.Count; i++) e.values[PaintValues.Header + i] = strokeR[i];
+
+        outline3D.Clear();
+        outline3D.AddRange(strokeP3);
+        strokeUV.Clear(); strokeR.Clear(); strokeP3.Clear();
+        Commit(e, true);
+    }
+
+    EditResult ExecutePaint(MeshEdit e)
+    {
+        var r = new EditResult();
+        float[] v = e.values;
+        if (e.points2D == null || e.points2D.Length < 1 || v == null ||
+            v.Length < PaintValues.Header + e.points2D.Length || !EnsurePaintLayer(false))
+            return r;
+
+        pHard = v[PaintValues.Hardness];
+        pOpacity = v[PaintValues.Opacity];
+        pColor = new Color(v[PaintValues.Red], v[PaintValues.Green], v[PaintValues.Blue], v[PaintValues.Alpha]);
+        for (int i = 0; i < e.points2D.Length; i++)
+        {
+            float rad = v[PaintValues.Header + i];
+            if (i == 0) StampPaintSegment(e.points2D[0], rad, e.points2D[0], rad);
+            else StampPaintSegment(e.points2D[i - 1], v[PaintValues.Header + i - 1], e.points2D[i], rad);
+        }
+
+        r.changed = true;
+        r.trisBefore = r.trisAfter = T.Count / 3;
+        return r;
+    }
+
     void AddScrapePoint(Vector2 screen)
     {
         if (!RaycastSurface(screen, out Vector2 uv, out Vector3 localHit, out float uvPerLocal)) return;
@@ -964,20 +1082,53 @@ public class MeshHoleCutter : MonoBehaviour
 
     // ------------------------------------------------------------------ Scrape mode: paint layer
     // Creates the runtime albedo + normal textures and hooks them into the material. Returns false if that is impossible.
-    bool EnsurePaintLayer()
+    bool EnsurePaintLayer(bool requireNormal = true)
     {
-        if (paintReady) return true;
+        if (paintReady)
+        {
+            if (requireNormal && !normalTex)
+            {
+                Debug.LogWarning("MeshHoleCutter: scraping requires a material with a normal-map property.", this);
+                return false;
+            }
+            return true;
+        }
         if (!targetPumpkin) return false;
 
         paintRenderer = targetPumpkin.GetComponent<MeshRenderer>();
         if (!paintRenderer) return false;
 
         paintMat = paintRenderer.material;      // instance of the FIRST material slot, so other objects sharing it are not touched
-        string texName = paintMat.HasProperty("_BaseMap") ? "_BaseMap" : (paintMat.HasProperty("_MainTex") ? "_MainTex" : null);
-        string colName = paintMat.HasProperty("_BaseColor") ? "_BaseColor" : (paintMat.HasProperty("_Color") ? "_Color" : null);
-        if (texName == null || !paintMat.HasProperty("_BumpMap"))
+        string[] baseTexNames = { "_BaseColorMap", "_BaseMap", "_MainTex" };
+        string texName = null;
+        for (int i = 0; i < baseTexNames.Length; i++)
         {
-            Debug.LogWarning("MeshHoleCutter: scrape needs a Standard or URP Lit material (_MainTex/_BaseMap + _BumpMap).", this);
+            if (paintMat.HasProperty(baseTexNames[i]) && paintMat.GetTexture(baseTexNames[i]))
+            {
+                texName = baseTexNames[i];
+                break;
+            }
+        }
+        if (texName == null)
+        {
+            for (int i = 0; i < baseTexNames.Length; i++)
+            {
+                if (paintMat.HasProperty(baseTexNames[i]))
+                {
+                    texName = baseTexNames[i];
+                    break;
+                }
+            }
+        }
+        string colName = paintMat.HasProperty("_BaseColor") ? "_BaseColor" : (paintMat.HasProperty("_Color") ? "_Color" : null);
+        string normalTexName = paintMat.HasProperty("_BumpMap") ? "_BumpMap" :
+                              (paintMat.HasProperty("_NormalMap") ? "_NormalMap" :
+                              (paintMat.HasProperty("NormalMap") ? "NormalMap" : null));
+        string normalScaleName = paintMat.HasProperty("_BumpScale") ? "_BumpScale" :
+                                (paintMat.HasProperty("Normal Scale") ? "Normal Scale" : null);
+        if (texName == null || (requireNormal && normalTexName == null))
+        {
+            Debug.LogWarning("MeshHoleCutter: painting needs a base texture; scraping also needs a normal-map property.", this);
             return false;
         }
 
@@ -1019,19 +1170,29 @@ public class MeshHoleCutter : MonoBehaviour
         }
 
         albedoTex = new Texture2D(pw, ph, TextureFormat.RGBA32, false, false) { name = "Pumpkin Albedo (Scrape)", filterMode = FilterMode.Bilinear };
-        normalTex = new Texture2D(pw, ph, TextureFormat.RGBA32, false, true) { name = "Pumpkin Normal (Scrape)", filterMode = FilterMode.Bilinear };
+        if (normalTexName != null)
+            normalTex = new Texture2D(pw, ph, TextureFormat.RGBA32, false, true) { name = "Pumpkin Normal (Scrape)", filterMode = FilterMode.Bilinear };
         heightMap = new float[n];
         maskMap = new float[n];
+        paintColorMap = new Color32[n];
+        paintAlphaMap = new float[n];
 
-        paintMat.SetTexture(texName, albedoTex);
-        paintMat.SetTextureScale(texName, Vector2.one);
-        paintMat.SetTextureOffset(texName, Vector2.zero);
+        for (int i = 0; i < baseTexNames.Length; i++)
+        {
+            if (!paintMat.HasProperty(baseTexNames[i])) continue;
+            paintMat.SetTexture(baseTexNames[i], albedoTex);
+            paintMat.SetTextureScale(baseTexNames[i], Vector2.one);
+            paintMat.SetTextureOffset(baseTexNames[i], Vector2.zero);
+        }
         if (colName != null) paintMat.SetColor(colName, Color.white);
-        paintMat.SetTexture("_BumpMap", normalTex);
-        paintMat.SetTextureScale("_BumpMap", Vector2.one);
-        paintMat.SetTextureOffset("_BumpMap", Vector2.zero);
-        if (paintMat.HasProperty("_BumpScale")) paintMat.SetFloat("_BumpScale", 1f);
-        paintMat.EnableKeyword("_NORMALMAP");
+        if (normalTex)
+        {
+            paintMat.SetTexture(normalTexName, normalTex);
+            paintMat.SetTextureScale(normalTexName, Vector2.one);
+            paintMat.SetTextureOffset(normalTexName, Vector2.zero);
+            if (normalScaleName != null) paintMat.SetFloat(normalScaleName, 1f);
+            paintMat.EnableKeyword("_NORMALMAP");
+        }
 
         paintReady = true;
         anyPaint = false;
@@ -1057,6 +1218,8 @@ public class MeshHoleCutter : MonoBehaviour
         paintReady = false;
         paintDirty = false;
         anyPaint = false;
+        paintColorMap = null;
+        paintAlphaMap = null;
         addedInnerSlot = false;
     }
 
@@ -1067,6 +1230,8 @@ public class MeshHoleCutter : MonoBehaviour
         if (!anyPaint) return;
         System.Array.Clear(heightMap, 0, heightMap.Length);
         System.Array.Clear(maskMap, 0, maskMap.Length);
+        System.Array.Clear(paintColorMap, 0, paintColorMap.Length);
+        System.Array.Clear(paintAlphaMap, 0, paintAlphaMap.Length);
         anyPaint = false;
         MarkDirty(0, 0, pw - 1, ph - 1);
     }
@@ -1099,6 +1264,62 @@ public class MeshHoleCutter : MonoBehaviour
             float t = i / (float)n;
             Stamp(Vector2.Lerp(a, b, t), Mathf.Lerp(ra, rb, t));
         }
+    }
+
+    void StampPaintSegment(Vector2 a, float ra, Vector2 b, float rb)
+    {
+        float rMax = Mathf.Max(ra, rb);
+        float dist = Vector2.Distance(a, b);
+        if (dist < 1e-6f || dist > rMax * SeamBreak) { StampPaint(b, rb); return; }
+
+        float stepUV = Mathf.Max(rMax * 0.25f, 1f / pw);
+        int n = Mathf.Max(1, Mathf.CeilToInt(dist / stepUV));
+        for (int i = 1; i <= n; i++)
+        {
+            float t = i / (float)n;
+            StampPaint(Vector2.Lerp(a, b, t), Mathf.Lerp(ra, rb, t));
+        }
+    }
+
+    void StampPaint(Vector2 uv, float rUV)
+    {
+        float rPx = Mathf.Max(rUV * pw, 1.5f);
+        float cx = uv.x * pw - 0.5f, cy = uv.y * ph - 0.5f;
+        int x0 = Mathf.Max(0, Mathf.FloorToInt(cx - rPx)), x1 = Mathf.Min(pw - 1, Mathf.CeilToInt(cx + rPx));
+        int y0 = Mathf.Max(0, Mathf.FloorToInt(cy - rPx)), y1 = Mathf.Min(ph - 1, Mathf.CeilToInt(cy + rPx));
+        if (x0 > x1 || y0 > y1) return;
+
+        float soft = Mathf.Max(1e-3f, 1f - pHard);
+        float colorAlpha = pOpacity * (pColor.a / 255f);
+        for (int y = y0; y <= y1; y++)
+        {
+            for (int x = x0; x <= x1; x++)
+            {
+                float dx = x - cx, dy = y - cy;
+                float d = Mathf.Sqrt(dx * dx + dy * dy) / rPx;
+                if (d >= 1f) continue;
+
+                float t = Mathf.Clamp01((d - pHard) / soft);
+                float alpha = colorAlpha * (1f - t * t * (3f - 2f * t));
+                if (alpha <= 0f) continue;
+
+                int i = y * pw + x;
+                Color32 previous = paintColorMap[i];
+                float oldAlpha = paintAlphaMap[i];
+                float nextAlpha = alpha + oldAlpha * (1f - alpha);
+                if (nextAlpha <= 0f) continue;
+
+                paintColorMap[i] = new Color32(
+                    (byte)((pColor.r * alpha + previous.r * oldAlpha * (1f - alpha)) / nextAlpha + 0.5f),
+                    (byte)((pColor.g * alpha + previous.g * oldAlpha * (1f - alpha)) / nextAlpha + 0.5f),
+                    (byte)((pColor.b * alpha + previous.b * oldAlpha * (1f - alpha)) / nextAlpha + 0.5f),
+                    255);
+                paintAlphaMap[i] = nextAlpha;
+            }
+        }
+
+        anyPaint = true;
+        MarkDirty(x0 - 1, y0 - 1, x1 + 1, y1 + 1);
     }
 
     // One soft round dab. Uses min() for the height and max() for the mask, so overlapping dabs never add up
@@ -1140,7 +1361,7 @@ public class MeshHoleCutter : MonoBehaviour
     // Rebuilds albedo + normal map for the changed rectangle and uploads them
     void FlushPaint()
     {
-        if (!paintReady || !paintDirty || !albedoTex || !normalTex) return;
+        if (!paintReady || !paintDirty || !albedoTex) return;
 
         int x0 = Mathf.Max(0, dirtyMinX), x1 = Mathf.Min(pw - 1, dirtyMaxX);
         int y0 = Mathf.Max(0, dirtyMinY), y1 = Mathf.Min(ph - 1, dirtyMaxY);
@@ -1148,7 +1369,7 @@ public class MeshHoleCutter : MonoBehaviour
         if (x0 > x1 || y0 > y1) return;
 
         NativeArray<Color32> aRaw = albedoTex.GetRawTextureData<Color32>();
-        NativeArray<Color32> nRaw = normalTex.GetRawTextureData<Color32>();
+        NativeArray<Color32> nRaw = normalTex ? normalTex.GetRawTextureData<Color32>() : default(NativeArray<Color32>);
         Color32 sc = scrapeColor;
         float gain = normalStrength * (pw / 128f);
 
@@ -1167,13 +1388,22 @@ public class MeshHoleCutter : MonoBehaviour
 
                 // tangent space normal (+X = U, +Y = V). Alpha stays 255 so it decodes right on desktop and mobile.
                 float inv = 1f / Mathf.Sqrt(gx * gx + gy * gy + 1f);
-                nRaw[i] = new Color32(
-                    (byte)((-gx * inv * 0.5f + 0.5f) * 255f + 0.5f),
-                    (byte)((-gy * inv * 0.5f + 0.5f) * 255f + 0.5f),
-                    (byte)((inv * 0.5f + 0.5f) * 255f + 0.5f),
-                    255);
+                if (normalTex)
+                    nRaw[i] = new Color32(
+                        (byte)((-gx * inv * 0.5f + 0.5f) * 255f + 0.5f),
+                        (byte)((-gy * inv * 0.5f + 0.5f) * 255f + 0.5f),
+                        (byte)((inv * 0.5f + 0.5f) * 255f + 0.5f),
+                        255);
 
                 Color32 c = baseCol[i];
+                float paintAlpha = paintAlphaMap[i];
+                if (paintAlpha > 0.001f)
+                {
+                    Color32 painted = paintColorMap[i];
+                    c.r = (byte)(c.r + (painted.r - c.r) * paintAlpha + 0.5f);
+                    c.g = (byte)(c.g + (painted.g - c.g) * paintAlpha + 0.5f);
+                    c.b = (byte)(c.b + (painted.b - c.b) * paintAlpha + 0.5f);
+                }
                 float m = maskMap[i];
                 if (m > 0.001f)
                 {
@@ -1187,7 +1417,7 @@ public class MeshHoleCutter : MonoBehaviour
         }
 
         albedoTex.Apply(false);
-        normalTex.Apply(false);
+        if (normalTex) normalTex.Apply(false);
     }
 
     // ------------------------------------------------------------------ Cut pipeline
@@ -1977,6 +2207,7 @@ static class CutInput
     public static bool Key1 => Keyboard.current != null && Keyboard.current.digit1Key.wasPressedThisFrame;
     public static bool Key2 => Keyboard.current != null && Keyboard.current.digit2Key.wasPressedThisFrame;
     public static bool Key3 => Keyboard.current != null && Keyboard.current.digit3Key.wasPressedThisFrame;
+    public static bool Key4 => Keyboard.current != null && Keyboard.current.digit4Key.wasPressedThisFrame;
     public static bool Tab => Keyboard.current != null && Keyboard.current.tabKey.wasPressedThisFrame;
     static bool Ctrl => Keyboard.current != null && (Keyboard.current.ctrlKey.isPressed || Keyboard.current.leftCommandKey.isPressed);
     public static bool UndoPressed => Ctrl && Keyboard.current.zKey.wasPressedThisFrame;

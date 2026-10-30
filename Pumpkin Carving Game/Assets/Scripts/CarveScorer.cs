@@ -59,12 +59,13 @@ public class SurfaceSamples
 public static class CarveMetrics
 {
     /// <summary>Which surface samples were carved away by the first editCount edits.</summary>
-    public static bool[] RemovedMask(SurfaceSamples s, IReadOnlyList<MeshEdit> edits, int editCount)
+    public static bool[] RemovedMask(SurfaceSamples s, IReadOnlyList<MeshEdit> edits, int editCount, float yawOffset = 0f)
     {
         var mask = new bool[s.pos.Length];
+        Quaternion yaw = Quaternion.AngleAxis(yawOffset, Vector3.up);
         for (int i = 0; i < editCount && i < edits.Count; i++)
         {
-            if (edits[i].tool == EditTool.LassoCut) AddLasso(s, edits[i], mask);
+            if (edits[i].tool == EditTool.LassoCut) AddLasso(s, edits[i], mask, yaw);
             // add other tools here
         }
         return mask;
@@ -96,7 +97,7 @@ public static class CarveMetrics
 
     // Marks the samples a lasso edit would have removed (same rules as the real cut: inside the shape,
     // facing the camera, within the depth window of the nearest visible surface).
-    static void AddLasso(SurfaceSamples s, MeshEdit ed, bool[] mask)
+    static void AddLasso(SurfaceSamples s, MeshEdit ed, bool[] mask, Quaternion yaw)
     {
         float[] v = ed.values;
         if (ed.points2D == null || ed.points2D.Length < 3 || v == null || v.Length < LassoValues.Count) return;
@@ -124,12 +125,14 @@ public static class CarveMetrics
 
         for (int i = 0; i < s.pos.Length; i++)
         {
-            if (!ProjectPoint(view, proj, pix, s.pos[i], out Vector2 sp, out float depth)) continue;
+            Vector3 samplePosition = yaw * s.pos[i];
+            Vector3 sampleNormal = yaw * s.nrm[i];
+            if (!ProjectPoint(view, proj, pix, samplePosition, out Vector2 sp, out float depth)) continue;
             if (sp.x < min.x || sp.x > max.x || sp.y < min.y || sp.y > max.y) continue;
             if (frontOnly)
             {
-                bool facing = ortho ? Vector3.Dot(s.nrm[i], camFwd) < 0f
-                                    : Vector3.Dot(s.nrm[i], camPos - s.pos[i]) > 0f;
+                bool facing = ortho ? Vector3.Dot(sampleNormal, camFwd) < 0f
+                                    : Vector3.Dot(sampleNormal, camPos - samplePosition) > 0f;
                 if (!facing) continue;
             }
             if (!Inside(poly, sp)) continue;
@@ -222,6 +225,7 @@ public class CarveScorer : MonoBehaviour
     public bool showScoreUI = true;
 
     public CarveScore Current { get; private set; }
+    public float CurrentYawAlignment { get; private set; }
     public event Action<CarveScore> Scored;     // raised by Submit()
 
     SurfaceSamples samples;
@@ -258,7 +262,7 @@ public class CarveScorer : MonoBehaviour
         if (!showScoreUI || !cutter) return;
 
         float uiScale = cutter.UiScale;
-        var r = new Rect(10, Screen.height / uiScale - 150, 340, 140);
+        var r = new Rect(10, Screen.height / uiScale - 180, 340, 170);
         cutter.extraBlockedRect = r;
         Matrix4x4 originalMatrix = GUI.matrix;
         GUI.matrix = Matrix4x4.Scale(new Vector3(uiScale, uiScale, 1f)) * originalMatrix;
@@ -274,6 +278,7 @@ public class CarveScorer : MonoBehaviour
         {
             GUILayout.Label("Target: " + (templates != null && templateIndex < templates.Length ? templates[templateIndex].name : "-"));
             GUILayout.Label("Accuracy: " + Mathf.RoundToInt(Current.accuracy * 100f) + "%");
+            GUILayout.Label("Best Y rotation match: " + Mathf.RoundToInt(CurrentYawAlignment) + " deg");
             GUILayout.Label("Shape carved: " + Mathf.RoundToInt(Current.coverage * 100f) + "%     Extra cut: " + Mathf.RoundToInt(Current.overcut * 100f) + "%");
             GUILayout.BeginHorizontal();
             if (GUILayout.Button("Submit")) Submit();
@@ -373,7 +378,35 @@ public class CarveScorer : MonoBehaviour
     {
         if (targetMask == null) { Current = default(CarveScore); return; }
         bool[] player = CarveMetrics.RemovedMask(samples, cutter.History, cutter.AppliedEditCount);
-        Current = CarveMetrics.Score(targetMask, player);
+        float bestYaw = 0f;
+        CarveScore best = default(CarveScore);
+
+        for (int i = 0; i < 4; i++)
+            EvaluateYaw(i * 90f, player, ref bestYaw, ref best);
+
+        float[] refinements = { 22.5f, 5.625f, 1.40625f };
+        for (int pass = 0; pass < refinements.Length; pass++)
+        {
+            float step = refinements[pass];
+            float center = bestYaw;
+            for (int i = -2; i <= 2; i++)
+                EvaluateYaw(center + i * step, player, ref bestYaw, ref best);
+        }
+
+        CurrentYawAlignment = Mathf.Repeat(bestYaw, 360f);
+        Current = best;
+    }
+
+    void EvaluateYaw(float yaw, bool[] player, ref float bestYaw, ref CarveScore best)
+    {
+        float candidateYaw = Mathf.Repeat(yaw, 360f);
+        bool[] target = CarveMetrics.RemovedMask(samples, targetEdits, targetEdits.Count, candidateYaw);
+        CarveScore score = CarveMetrics.Score(target, player);
+        if (score.accuracy > best.accuracy)
+        {
+            bestYaw = candidateYaw;
+            best = score;
+        }
     }
 
     // ---- stencil: the reference outline drawn on the pumpkin surface
