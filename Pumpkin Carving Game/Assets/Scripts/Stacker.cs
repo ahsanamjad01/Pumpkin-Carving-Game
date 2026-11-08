@@ -9,6 +9,7 @@ public class Stacker : MonoBehaviour
     [Header("Objects")]
     [SerializeField] private GameObject prefab;
     [SerializeField] private int objectCount = 11;
+    [SerializeField] private int objectid = 0;
 
     [Header("Pyramid")]
     [SerializeField] private int baseRowCount = 5;
@@ -92,26 +93,47 @@ public class Stacker : MonoBehaviour
             return;
 
         objects.Remove(obj);
+        obj.transform.parent = null;
         CanSelectMore = false;
         selectedPumpkin = obj;
 
 
         obj.transform.DOKill();
-        obj.transform.DOMove(SelectedPumpkinPosition.position, moveDuration)
-            .SetEase(moveEase).OnComplete(() =>
-            {
-                if (meshHoleCutter != null)
-                {
-                    meshHoleCutter.targetPumpkin = obj;
-                    meshHoleCutter.SetMode(MeshHoleCutter.Mode.Rotate);
-                    meshHoleCutter.canCut = true;
-                    meshHoleCutter.SetTargetPumpkin(obj);
-                    carveScorer.Initialize();
-                }
-            });
 
-        obj.transform.DORotate(SelectedPumpkinPosition.rotation.eulerAngles, moveDuration)
-            .SetEase(moveEase);
+        if(objectid == 0)
+        {
+            obj.transform.DOMove(SelectedPumpkinPosition.position, moveDuration)
+                .SetEase(moveEase).OnComplete(() =>
+                {
+                    if (meshHoleCutter != null)
+                    {
+                        meshHoleCutter.targetPumpkin = obj;
+                        meshHoleCutter.SetMode(MeshHoleCutter.Mode.Rotate);
+                        meshHoleCutter.canCut = true;
+                        meshHoleCutter.SetTargetPumpkin(obj);
+                        carveScorer.Initialize();
+                    }
+                });
+
+            obj.transform.DORotate(SelectedPumpkinPosition.rotation.eulerAngles, moveDuration)
+                .SetEase(moveEase);
+        }
+        else
+        {
+            obj.transform.parent = meshHoleCutter.targetPumpkin.transform;
+            obj.transform.localRotation = Quaternion.identity;
+    
+            obj.transform.DOLocalMove(Vector3.zero, 0.5f)
+                .SetEase(Ease.Linear)
+                .OnComplete(() =>
+                {
+                    if (obj.transform.childCount >= 2)
+                    {
+                        obj.transform.GetChild(0).gameObject.SetActive(false);
+                        obj.transform.GetChild(1).gameObject.SetActive(true);
+                    }
+                });
+        }
 
         RearrangePyramid(true);
     }

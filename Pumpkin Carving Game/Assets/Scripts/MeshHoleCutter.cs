@@ -50,6 +50,21 @@ public class MeshHoleCutter : MonoBehaviour
 
     public enum Mode { Rotate = 0, Cut = 1, Scrape = 2, Paint = 3 }
 
+    [System.Serializable]
+    public class CameraPanRegion
+    {
+        [Tooltip("Minimum camera X position in this region.")]
+        public float minX;
+        [Tooltip("Maximum camera X position in this region.")]
+        public float maxX = 4f;
+        [Tooltip("Camera Y position when entering this region.")]
+        public float cameraY;
+        [Tooltip("Camera Z position when entering this region.")]
+        public float cameraZ = -10f;
+
+        public float CenterX => (minX + maxX) * 0.5f;
+    }
+
     // ------------------------------------------------------------------ Inspector
     [Header("General")]
     public Camera cam;
@@ -72,13 +87,17 @@ public class MeshHoleCutter : MonoBehaviour
     public float minCameraX = -4f;
     [Tooltip("Left/right camera pan limit in world units.")]
     public float maxCameraX = 4f;
+    [Tooltip("Optional regions for each menu. Swiping past a region edge moves to the nearest region in that direction.")]
+    public List<CameraPanRegion> cameraPanRegions = new List<CameraPanRegion>();
+    [Tooltip("Time in seconds to move to the center of the next pan region.")]
+    [Min(0.01f)] public float cameraPanTransitionDuration = 0.5f;
 
     [Header("Cut Mode (lasso)")]
-    [Tooltip("Distance in pixels between recorded mouse points")]
+    [Tooltip("Distance in reference pixels (at a 768px camera height) between recorded mouse points")]
     public float lassoPointSpacing = 8f;
     [Tooltip("How many times the drawn outline is rounded off. 0 = raw polygon")]
     [Range(0, 3)] public int lassoSmoothing = 2;
-    [Tooltip("Shapes smaller than this (pixels^2) are ignored")]
+    [Tooltip("Shapes smaller than this many reference pixels squared (at a 768px camera height) are ignored")]
     public float minLassoArea = 150f;
     [Tooltip("ON: only triangles facing the camera are cut, so the back side is never touched.")]
     public bool frontFacesOnly = true;
@@ -129,7 +148,7 @@ public class MeshHoleCutter : MonoBehaviour
     public bool wallsUseInnerMaterial = true;
 
     [Header("Quality / Performance")]
-    [Tooltip("Target triangle edge size along the cut outline, in screen pixels (smaller = smoother hole, more triangles)")]
+    [Tooltip("Target triangle edge size along the cut outline, in reference pixels at a 768px camera height (smaller = smoother hole, more triangles)")]
     public float edgePixels = 8f;
     [Tooltip("Pushes new vertices onto the curved surface (uses vertex normals). 0 = off")]
     [Range(0f, 1f)] public float curvatureSmoothing = 0.5f;
@@ -236,10 +255,16 @@ public class MeshHoleCutter : MonoBehaviour
     // interaction
     bool dirty, colliderDirty, dragging, justPressed;
     Vector2 lastMouse;
+    int activeCameraPanRegion = -1;
+    bool invalidCameraPanRegionsReported;
+    bool cameraPanTransitioning;
+    float cameraPanTransitionElapsed;
+    Vector3 cameraPanTransitionStart;
+    Vector3 cameraPanTransitionTarget;
     Rect uiRect = new Rect(10, 10, 300, 140);
     static readonly string[] ModeLabels = { "Rotate [1]", "Cut [2]", "Scrape [3]", "Paint [4]" };
 
-    public float UiScale => Mathf.Max(Screen.height, 1) / ReferenceResolutionHeight;
+    public float UiScale => GetReferenceResolutionScale(Screen.height);
 
     float InputScale
     {
@@ -247,8 +272,13 @@ public class MeshHoleCutter : MonoBehaviour
         {
             float height = cam ? cam.pixelRect.height : Screen.height;
             if (height <= 0f) height = Screen.height;
-            return Mathf.Max(height, 1f) / ReferenceResolutionHeight;
+            return GetReferenceResolutionScale(height);
         }
+    }
+
+    static float GetReferenceResolutionScale(float height)
+    {
+        return Mathf.Max(height, 1f) / ReferenceResolutionHeight;
     }
 
     // edit history
@@ -345,6 +375,8 @@ public class MeshHoleCutter : MonoBehaviour
         else if (mode == Mode.Scrape) UpdateScrape(mp, overUI);
         else UpdatePaint(mp, overUI);
 
+        UpdateCameraPanTransition();
+
         if (hasCuttableMesh && dirty) { RebuildMesh(); dirty = false; }
         if (hasCuttableMesh && colliderDirty && !dragging)
         {
@@ -393,6 +425,26 @@ public class MeshHoleCutter : MonoBehaviour
         dragging = false;
         lasso.Clear();
         HideLine();
+    }
+
+    public void SetRotateMode()
+    {
+        SetMode(Mode.Rotate);
+    }
+    
+    public void SetCutMode()
+    {
+        SetMode(Mode.Cut);
+    }
+    
+    public void SetScrapeMode()
+    {
+        SetMode(Mode.Scrape);
+    }
+    
+    public void SetPaintMode()
+    {
+        SetMode(Mode.Paint);
     }
 
     public void ResetMesh()
@@ -657,7 +709,7 @@ public class MeshHoleCutter : MonoBehaviour
                         Quaternion.AngleAxis(totalYaw, Vector3.up) *
                         baseRotation;
                 }
-                else if (cam != null && cam.pixelHeight > 0)
+                else if (cam != null && cam.pixelHeight > 0 && !cameraPanTransitioning)
                 {
                     float depth = targetPumpkin
                         ? Mathf.Max(Vector3.Dot(targetPumpkin.transform.position - cam.transform.position, cam.transform.forward), cam.nearClipPlane)
@@ -667,11 +719,14 @@ public class MeshHoleCutter : MonoBehaviour
                         : 2f * depth * Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad) / cam.pixelHeight;
 
                     Vector3 pos = cam.transform.position;
-                    pos.x = Mathf.Clamp(
-                        pos.x - d.x * worldUnitsPerPixel * cameraPanSpeed,
-                        minCameraX,
-                        maxCameraX);
-                    cam.transform.position = pos;
+                    float requestedX = pos.x - d.x * worldUnitsPerPixel * cameraPanSpeed;
+                    if (cameraPanRegions != null && cameraPanRegions.Count > 0)
+                        PanWithinRegions(pos, requestedX);
+                    else
+                    {
+                        pos.x = Mathf.Clamp(requestedX, minCameraX, maxCameraX);
+                        cam.transform.position = pos;
+                    }
                 }
             }
             justPressed = false;
@@ -680,6 +735,128 @@ public class MeshHoleCutter : MonoBehaviour
         {
             dragging = false;
             draggingPumpkin = false;
+        }
+    }
+
+    void PanWithinRegions(Vector3 cameraPosition, float requestedX)
+    {
+        if (activeCameraPanRegion < 0 || activeCameraPanRegion >= cameraPanRegions.Count ||
+            cameraPanRegions[activeCameraPanRegion] == null)
+            activeCameraPanRegion = FindCameraPanRegion(cameraPosition.x);
+
+        if (activeCameraPanRegion < 0)
+        {
+            cameraPosition.x = Mathf.Clamp(requestedX, minCameraX, maxCameraX);
+            cam.transform.position = cameraPosition;
+            return;
+        }
+
+        CameraPanRegion region = cameraPanRegions[activeCameraPanRegion];
+        float minX = Mathf.Min(region.minX, region.maxX);
+        float maxX = Mathf.Max(region.minX, region.maxX);
+
+        if (requestedX > maxX)
+        {
+            int nextRegion = FindAdjacentCameraPanRegion(activeCameraPanRegion, 1);
+            if (nextRegion >= 0)
+            {
+                BeginCameraPanTransition(nextRegion);
+                return;
+            }
+        }
+        else if (requestedX < minX)
+        {
+            int nextRegion = FindAdjacentCameraPanRegion(activeCameraPanRegion, -1);
+            if (nextRegion >= 0)
+            {
+                BeginCameraPanTransition(nextRegion);
+                return;
+            }
+        }
+
+        cameraPosition.x = Mathf.Clamp(requestedX, minX, maxX);
+        cam.transform.position = cameraPosition;
+    }
+
+    int FindCameraPanRegion(float x)
+    {
+        int closestRegion = -1;
+        float closestDistance = float.PositiveInfinity;
+        for (int i = 0; i < cameraPanRegions.Count; i++)
+        {
+            CameraPanRegion region = cameraPanRegions[i];
+            if (region == null) continue;
+
+            float minX = Mathf.Min(region.minX, region.maxX);
+            float maxX = Mathf.Max(region.minX, region.maxX);
+            float distance = x < minX ? minX - x : x > maxX ? x - maxX : 0f;
+            if (distance < closestDistance)
+            {
+                closestDistance = distance;
+                closestRegion = i;
+            }
+        }
+
+        if (closestRegion < 0)
+        {
+            if (!invalidCameraPanRegionsReported)
+                Debug.LogError("MeshHoleCutter: camera pan regions contains no valid regions.", this);
+            invalidCameraPanRegionsReported = true;
+            return -1;
+        }
+        invalidCameraPanRegionsReported = false;
+        return closestRegion;
+    }
+
+    int FindAdjacentCameraPanRegion(int regionIndex, int direction)
+    {
+        CameraPanRegion currentRegion = cameraPanRegions[regionIndex];
+        float currentCenterX = (Mathf.Min(currentRegion.minX, currentRegion.maxX) +
+                                Mathf.Max(currentRegion.minX, currentRegion.maxX)) * 0.5f;
+        int adjacentIndex = -1;
+        float closestCenterDistance = float.PositiveInfinity;
+
+        for (int i = 0; i < cameraPanRegions.Count; i++)
+        {
+            if (i == regionIndex || cameraPanRegions[i] == null) continue;
+
+            CameraPanRegion candidate = cameraPanRegions[i];
+            float candidateCenterX = (Mathf.Min(candidate.minX, candidate.maxX) +
+                                      Mathf.Max(candidate.minX, candidate.maxX)) * 0.5f;
+            float centerDistance = (candidateCenterX - currentCenterX) * direction;
+            if (centerDistance > 0f && centerDistance < closestCenterDistance)
+            {
+                closestCenterDistance = centerDistance;
+                adjacentIndex = i;
+            }
+        }
+        return adjacentIndex;
+    }
+
+    void BeginCameraPanTransition(int regionIndex)
+    {
+        CameraPanRegion region = cameraPanRegions[regionIndex];
+        activeCameraPanRegion = regionIndex;
+        cameraPanTransitionStart = cam.transform.position;
+        cameraPanTransitionTarget = new Vector3(region.CenterX, region.cameraY, region.cameraZ);
+        cameraPanTransitionElapsed = 0f;
+        cameraPanTransitioning = true;
+    }
+
+    void UpdateCameraPanTransition()
+    {
+        if (!cameraPanTransitioning || !cam) return;
+
+        cameraPanTransitionElapsed += Time.deltaTime;
+        float duration = Mathf.Max(0.01f, cameraPanTransitionDuration);
+        float t = Mathf.Clamp01(cameraPanTransitionElapsed / duration);
+        t = t * t * (3f - 2f * t);
+        cam.transform.position = Vector3.Lerp(cameraPanTransitionStart, cameraPanTransitionTarget, t);
+
+        if (cameraPanTransitionElapsed >= duration)
+        {
+            cam.transform.position = cameraPanTransitionTarget;
+            cameraPanTransitioning = false;
         }
     }
 
@@ -733,11 +910,13 @@ public class MeshHoleCutter : MonoBehaviour
         HideLine();
         if (lasso.Count < 3) { lasso.Clear(); return; }
 
+        CameraSnapshot camera = CaptureCamera();
+        float resolutionScale = GetReferenceResolutionScale(camera.pixelRect.height);
+
         // input filter: ignore tiny shapes
         List<Vector2> preview = new List<Vector2>(lasso);
         for (int i = 0; i < lassoSmoothing; i++) preview = Chaikin(preview);
-        float areaScale = InputScale;
-        if (Mathf.Abs(SignedArea(preview)) < minLassoArea * areaScale * areaScale) { lasso.Clear(); return; }
+        if (Mathf.Abs(SignedArea(preview)) < minLassoArea * resolutionScale * resolutionScale) { lasso.Clear(); return; }
 
         // record what the player did; Commit applies it and stores it in the history
         var e = new MeshEdit
@@ -745,12 +924,12 @@ public class MeshHoleCutter : MonoBehaviour
             tool = EditTool.LassoCut,
             points2D = lasso.ToArray(),
             values = new float[LassoValues.Count],
-            camera = CaptureCamera()
+            camera = camera
         };
         e.values[LassoValues.Smoothing] = lassoSmoothing;
         e.values[LassoValues.FrontOnly] = frontFacesOnly ? 1f : 0f;
         e.values[LassoValues.Depth] = cutDepth;
-        e.values[LassoValues.EdgePx] = edgePixels * InputScale;
+        e.values[LassoValues.EdgePx] = edgePixels * resolutionScale;
         e.values[LassoValues.Curvature] = curvatureSmoothing;
         e.values[LassoValues.RemoveLoose] = removeLooseParts ? 1f : 0f;
         e.values[LassoValues.MaxPasses] = maxRefinePasses;
@@ -776,7 +955,7 @@ public class MeshHoleCutter : MonoBehaviour
         }
 
         // small shapes get finer triangles so their outline never looks coarse
-        float minimumEdgePx = 1.5f * Mathf.Max(activeCam.pixelRect.height, 1f) / ReferenceResolutionHeight;
+        float minimumEdgePx = 1.5f * GetReferenceResolutionScale(activeCam.pixelRect.height);
         float targetPx = Mathf.Clamp(perimeter / 64f, minimumEdgePx, Mathf.Max(minimumEdgePx, edgePixels));
         PerformCut(targetPx);
     }
