@@ -92,6 +92,14 @@ public class MeshHoleCutter : MonoBehaviour
     [Tooltip("Time in seconds to move to the center of the next pan region.")]
     [Min(0.01f)] public float cameraPanTransitionDuration = 0.5f;
 
+    [Header("Camera Zoom")]
+    public bool enableZoom = true;
+    public float zoomSpeed = 2.5f;
+    [Tooltip("Closest zoom (smallest FOV or ortho size).")]
+    public float minZoomThreshold = 18f;
+    [Tooltip("Furthest zoom (largest FOV or ortho size).")]
+    public float maxZoomThreshold = 45f;
+
     [Header("Cut Mode (lasso)")]
     [Tooltip("Distance in reference pixels (at a 768px camera height) between recorded mouse points")]
     public float lassoPointSpacing = 8f;
@@ -295,6 +303,11 @@ public class MeshHoleCutter : MonoBehaviour
     void Awake()
     {
         if (!cam) cam = Camera.main;
+        if (cam)
+        {
+            defaultCameraFOV = cam.fieldOfView;
+            defaultOrthoSize = cam.orthographicSize;
+        }
         if (targetPumpkin) SetTargetPumpkin(targetPumpkin);
     }
 
@@ -376,6 +389,7 @@ public class MeshHoleCutter : MonoBehaviour
         else UpdatePaint(mp, overUI);
 
         UpdateCameraPanTransition();
+        UpdateCameraZoom(overUI, hasCuttableMesh);
 
         if (hasCuttableMesh && dirty) { RebuildMesh(); dirty = false; }
         if (hasCuttableMesh && colliderDirty && !dragging)
@@ -857,6 +871,41 @@ public class MeshHoleCutter : MonoBehaviour
         {
             cam.transform.position = cameraPanTransitionTarget;
             cameraPanTransitioning = false;
+        }
+    }
+
+    float defaultCameraFOV = 31f;
+    float defaultOrthoSize = 5f;
+
+    void UpdateCameraZoom(bool overUI, bool hasPumpkinSelected)
+    {
+        if (!enableZoom || !cam) return;
+
+        // If no pumpkin is currently on the table, reset to default view and disable zoom
+        if (!hasPumpkinSelected)
+        {
+            if (cam.orthographic)
+                cam.orthographicSize = Mathf.MoveTowards(cam.orthographicSize, defaultOrthoSize, Time.deltaTime * 10f);
+            else
+                cam.fieldOfView = Mathf.MoveTowards(cam.fieldOfView, defaultCameraFOV, Time.deltaTime * 30f);
+            return;
+        }
+
+        if (overUI) return;
+
+        float scroll = CutInput.MouseScrollY;
+        if (Mathf.Abs(scroll) < 0.01f) return;
+
+        if (cam.orthographic)
+        {
+            float targetSize = cam.orthographicSize - Mathf.Sign(scroll) * zoomSpeed * 0.5f;
+            cam.orthographicSize = Mathf.Clamp(targetSize, minZoomThreshold * 0.1f, maxZoomThreshold * 0.2f);
+        }
+        else
+        {
+            // Perspective camera: adjust Field of View (FOV) clamped within thresholds
+            float targetFOV = cam.fieldOfView - Mathf.Sign(scroll) * zoomSpeed;
+            cam.fieldOfView = Mathf.Clamp(targetFOV, minZoomThreshold, maxZoomThreshold);
         }
     }
 
@@ -2391,4 +2440,5 @@ static class CutInput
     static bool Ctrl => Keyboard.current != null && (Keyboard.current.ctrlKey.isPressed || Keyboard.current.leftCommandKey.isPressed);
     public static bool UndoPressed => Ctrl && Keyboard.current.zKey.wasPressedThisFrame;
     public static bool RedoPressed => Ctrl && Keyboard.current.yKey.wasPressedThisFrame;
+    public static float MouseScrollY => Mouse.current != null ? Mouse.current.scroll.ReadValue().y : 0f;
 }

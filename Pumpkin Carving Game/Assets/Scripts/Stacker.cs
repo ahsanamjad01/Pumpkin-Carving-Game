@@ -112,6 +112,10 @@ public class Stacker : MonoBehaviour
                         meshHoleCutter.canCut = true;
                         meshHoleCutter.SetTargetPumpkin(obj);
                         carveScorer.Initialize();
+                        if (CustomerManager.Instance != null)
+                        {
+                            CustomerManager.Instance.ApplyCurrentOrderStencil();
+                        }
                     }
                 });
 

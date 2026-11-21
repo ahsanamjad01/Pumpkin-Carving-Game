@@ -328,7 +328,12 @@ public class CarveScorer : MonoBehaviour
     public CarveScore Submit()
     {
         Recompute();
-        Destroy(_cutter.targetPumpkin);
+        if (_cutter != null && _cutter.targetPumpkin != null)
+        {
+            GameObject toDestroy = _cutter.targetPumpkin;
+            _cutter.targetPumpkin = null;
+            Destroy(toDestroy);
+        }
         _stacker.CanSelectMore = true;
         if (Scored != null) Scored(Current);
         return Current;

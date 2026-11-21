@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>Inventory and purchase operations used by shop UI and tool selection.</summary>
@@ -32,11 +33,16 @@ public class InventoryManager : MonoBehaviour
         new Tools { id = PaintToolId, name = "Paint Brush", price = 50 }
     };
 
+    const string SaveKey = "PumpkinGame_InventoryData";
+
+    public event Action<int> OnCoinsChanged;
+    public event Action<int> OnToolUnlocked;
+
     public int Coins { get { return data != null ? data.coins : 0; } }
 
     void Awake()
     {
-        if (data == null) data = new Data();
+        LoadData();
         if (tools == null || tools.Length == 0)
         {
             tools = new[]
@@ -47,6 +53,52 @@ public class InventoryManager : MonoBehaviour
             };
         }
         SyncUnlockedTools();
+    }
+
+    public void LoadData()
+    {
+        if (PlayerPrefs.HasKey(SaveKey))
+        {
+            try
+            {
+                string json = PlayerPrefs.GetString(SaveKey);
+                data = JsonUtility.FromJson<Data>(json);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("InventoryManager: Failed to load save data, resetting. " + e.Message);
+                data = new Data();
+            }
+        }
+        else
+        {
+            data = new Data();
+        }
+
+        // Apply unlocked states from saved data to tools array
+        if (data != null && data.unlockedTools != null && tools != null)
+        {
+            HashSet<int> unlockedSet = new HashSet<int>(data.unlockedTools);
+            unlockedSet.Add(CutToolId); // always unlocked
+
+            foreach (var t in tools)
+            {
+                if (unlockedSet.Contains(t.id))
+                {
+                    t.isUnlocked = true;
+                }
+            }
+        }
+    }
+
+    public void SaveData()
+    {
+        if (data != null)
+        {
+            string json = JsonUtility.ToJson(data);
+            PlayerPrefs.SetString(SaveKey, json);
+            PlayerPrefs.Save();
+        }
     }
 
     public bool IsToolUnlocked(int toolId)
@@ -82,6 +134,9 @@ public class InventoryManager : MonoBehaviour
         data.coins -= tool.price;
         tool.isUnlocked = true;
         SyncUnlockedTools();
+        SaveData();
+        OnCoinsChanged?.Invoke(data.coins);
+        OnToolUnlocked?.Invoke(tool.id);
         return true;
     }
 
@@ -103,12 +158,16 @@ public class InventoryManager : MonoBehaviour
         if (amount < 0) throw new ArgumentOutOfRangeException(nameof(amount));
         if (data == null) data = new Data();
         data.coins = checked(data.coins + amount);
+        SaveData();
+        OnCoinsChanged?.Invoke(data.coins);
     }
 
     public bool TrySpendCoins(int amount)
     {
         if (amount < 0 || data == null || data.coins < amount) return false;
         data.coins -= amount;
+        SaveData();
+        OnCoinsChanged?.Invoke(data.coins);
         return true;
     }
 
