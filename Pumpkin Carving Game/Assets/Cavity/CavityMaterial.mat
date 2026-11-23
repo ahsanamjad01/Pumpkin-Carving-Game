@@ -45,7 +45,7 @@ Material:
     - _DistortionAmmount: 0.0056
     - _DistortionScale: 15
     - _Exponent: 1.11
-    - _Intensity: 0.5
+    - _Intensity: 0.25
     - _Multiplier: 3.8
     - _Radius: 1
     - _Sharpness: 0
